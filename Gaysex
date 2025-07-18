@@ -1,23 +1,32 @@
+-- Анализ производительности токена с оценкой качества трейдеров
+-- Находит ранних покупателей в заданном временном окне и анализирует их полную торговую историю
+-- Применяет несколько фильтров качества для отбора только успешных трейдеров
+
 WITH token AS (
+    -- Настройка адреса целевого токена
     SELECT '0x0f758abf9b242daa6b2b5e976d6e00c5aece9b07' AS token_addr
 ),
--- 1. Находим покупателей в временном окне
+
+-- Шаг 1: Поиск кошельков, купивших токен в указанном временном окне
 window_buyers AS (
     SELECT
         s.origin_from_address AS wallet,
         MIN(s.block_timestamp) AS first_buy_ts
     FROM base.defi.ez_dex_swaps s
     CROSS JOIN token t
-    WHERE s.token_out = t.token_addr
-      AND s.block_timestamp BETWEEN '2025-07-16 14:00:00' AND '2025-07-16 15:35:00'
+    WHERE s.token_out = t.token_addr  -- Условие покупки токена
+      AND s.block_timestamp BETWEEN '2025-07-16 14:00:00' AND '2025-07-16 15:35:00'  -- Временное окно
     GROUP BY s.origin_from_address
 ),
--- 2. PnL по конкретному токену
+
+-- Шаг 2: Расчет PnL по конкретному токену за все время
 token_pnl AS (
     SELECT
         wb.wallet,
         wb.first_buy_ts,
+        -- Сумма всех покупок токена (token_out = целевой токен)
         SUM(CASE WHEN s.token_out = t.token_addr THEN s.amount_in_usd ELSE 0 END) AS token_buys_usd,
+        -- Сумма всех продаж токена (token_in = целевой токен)
         SUM(CASE WHEN s.token_in = t.token_addr THEN s.amount_out_usd ELSE 0 END) AS token_sells_usd
     FROM base.defi.ez_dex_swaps s
     JOIN window_buyers wb ON s.origin_from_address = wb.wallet
@@ -25,14 +34,18 @@ token_pnl AS (
     WHERE s.token_out = t.token_addr OR s.token_in = t.token_addr
     GROUP BY wb.wallet, wb.first_buy_ts
 ),
--- 3. Общий PnL кошелька по всем токенам
+
+-- Шаг 3: Расчет общей торговой производительности каждого трейдера
 overall_pnl AS (
     SELECT 
         s.origin_from_address AS wallet,
+        -- Общие покупки, исключая WETH как базовую валюту
         SUM(CASE WHEN s.token_out != '0x4200000000000000000000000000000000000006' 
             THEN s.amount_in_usd ELSE 0 END) AS overall_buys_usd,
+        -- Общие продажи, исключая WETH как базовую валюту
         SUM(CASE WHEN s.token_in != '0x4200000000000000000000000000000000000006' 
             THEN s.amount_out_usd ELSE 0 END) AS overall_sells_usd,
+        -- Метрики торговой активности
         COUNT(*) AS total_transactions,
         COUNT(DISTINCT DATE(s.block_timestamp)) AS active_days
     FROM base.defi.ez_dex_swaps s
@@ -40,39 +53,54 @@ overall_pnl AS (
     GROUP BY s.origin_from_address
 )
 
--- 4. Объединяем данные с новыми фильтрами
+-- Шаг 4: Объединение данных и применение фильтров качества
 SELECT 
     tp.wallet,
     tp.first_buy_ts AS block_timestamp,
     
-    -- Данные по конкретному токену
+    -- Метрики по конкретному токену
     tp.token_buys_usd,
     tp.token_sells_usd,
     tp.token_sells_usd - tp.token_buys_usd AS token_pnl_usd,
     
-    -- НОВОЕ: ROI по конкретному токену
+    -- Расчет ROI по токену
     CASE WHEN tp.token_buys_usd > 0 
          THEN (tp.token_sells_usd - tp.token_buys_usd) / tp.token_buys_usd * 100 
          ELSE 0 END AS token_roi_percentage,
     
-    -- Общие данные кошелька
+    -- Метрики общей производительности трейдера
     op.overall_sells_usd - op.overall_buys_usd AS overall_pnl_usd,
+    
+    -- Расчет общего ROI
     CASE WHEN op.overall_buys_usd > 0 
          THEN (op.overall_sells_usd - op.overall_buys_usd) / op.overall_buys_usd * 100 
          ELSE 0 END AS overall_roi_percentage,
+         
+    -- Статистика активности
     op.total_transactions,
     op.active_days
     
 FROM token_pnl tp
 JOIN overall_pnl op ON tp.wallet = op.wallet
+
+-- Фильтры качества
 WHERE tp.token_buys_usd > 0
-  AND (op.overall_sells_usd - op.overall_buys_usd) > 20000  -- Общий PnL > $20,000
+  AND (op.overall_sells_usd - op.overall_buys_usd) > 20000                     -- Фильтр 1: Общий PnL > $20,000
   AND CASE WHEN tp.token_buys_usd > 0 
            THEN (tp.token_sells_usd - tp.token_buys_usd) / tp.token_buys_usd * 100 
-           ELSE 0 END > 50  -- НОВЫЙ ФИЛЬТР: ROI по токену > 50%
-  AND (tp.token_sells_usd - tp.token_buys_usd) > 1.5 * tp.token_buys_usd  -- НОВЫЙ ФИЛЬТР: PnL > 1.5x от покупок
+           ELSE 0 END > 50                                                       -- Фильтр 2: ROI по токену > 50%
+  AND (tp.token_sells_usd - tp.token_buys_usd) > 1.5 * tp.token_buys_usd       -- Фильтр 3: Прибыль по токену > 1.5x от инвестиций
+
+-- Сортировка результатов и ограничение
 ORDER BY token_pnl_usd DESC
-LIMIT 30;0 
+LIMIT 30;
+
+-- Параметры для настройки:
+-- Строка 6: Адрес контракта токена
+-- Строка 15: Временное окно для поиска ранних покупателей
+-- Строка 33: Адрес WETH для сети Base (0x4200000000000000000000000000000000000006)
+-- Строки 66-70: Пороговые значения фильтров качества
+-- Строка 73: Максимальное количество возвращаемых результатов0 
          THEN (op.overall_sells_usd - op.overall_buys_usd) / op.overall_buys_usd * 100 
          ELSE 0 END AS overall_roi_percentage,
     op.total_transactions,
