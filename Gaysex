@@ -40,7 +40,7 @@ overall_pnl AS (
     GROUP BY s.origin_from_address
 )
 
--- 4. Объединяем данные с фильтром и скрытыми колонками
+-- 4. Объединяем данные с новыми фильтрами
 SELECT 
     tp.wallet,
     tp.first_buy_ts AS block_timestamp,
@@ -50,9 +50,29 @@ SELECT
     tp.token_sells_usd,
     tp.token_sells_usd - tp.token_buys_usd AS token_pnl_usd,
     
-    -- Общие данные кошелька (БЕЗ overall_buys_usd и overall_sells_usd)
+    -- НОВОЕ: ROI по конкретному токену
+    CASE WHEN tp.token_buys_usd > 0 
+         THEN (tp.token_sells_usd - tp.token_buys_usd) / tp.token_buys_usd * 100 
+         ELSE 0 END AS token_roi_percentage,
+    
+    -- Общие данные кошелька
     op.overall_sells_usd - op.overall_buys_usd AS overall_pnl_usd,
     CASE WHEN op.overall_buys_usd > 0 
+         THEN (op.overall_sells_usd - op.overall_buys_usd) / op.overall_buys_usd * 100 
+         ELSE 0 END AS overall_roi_percentage,
+    op.total_transactions,
+    op.active_days
+    
+FROM token_pnl tp
+JOIN overall_pnl op ON tp.wallet = op.wallet
+WHERE tp.token_buys_usd > 0
+  AND (op.overall_sells_usd - op.overall_buys_usd) > 20000  -- Общий PnL > $20,000
+  AND CASE WHEN tp.token_buys_usd > 0 
+           THEN (tp.token_sells_usd - tp.token_buys_usd) / tp.token_buys_usd * 100 
+           ELSE 0 END > 50  -- НОВЫЙ ФИЛЬТР: ROI по токену > 50%
+  AND (tp.token_sells_usd - tp.token_buys_usd) > 1.5 * tp.token_buys_usd  -- НОВЫЙ ФИЛЬТР: PnL > 1.5x от покупок
+ORDER BY token_pnl_usd DESC
+LIMIT 30;0 
          THEN (op.overall_sells_usd - op.overall_buys_usd) / op.overall_buys_usd * 100 
          ELSE 0 END AS overall_roi_percentage,
     op.total_transactions,
